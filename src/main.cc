@@ -20,6 +20,8 @@
 #include <iostream>
 #include <string>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 
 struct TDC1Rec {
   Int_t tdc;
@@ -145,14 +147,9 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
   }
 }
 
-int main(int argc, char** argv) {
-  if (argc < 3) {
-    std::cerr << "Usage: " << argv[0] << " input.root output.root\n";
-    return 1;
-  }
-
-  const std::string inFile = argv[1];
-  const std::string outFile = argv[2];
+static int ProcessFile(const std::string& inFile, const std::string& outDir) {
+  const std::filesystem::path outPath = std::filesystem::path(outDir)
+                                        / std::filesystem::path(inFile).filename();
 
   TFile fin(inFile.c_str(), "READ");
   if (fin.IsZombie()) {
@@ -180,6 +177,7 @@ int main(int argc, char** argv) {
   }
 
   // Output
+  const std::string outFile = outPath.string();
   TFile fout(outFile.c_str(), "RECREATE");
   if (fout.IsZombie()) {
     std::cerr << "[ERROR] Cannot create output file: " << outFile << "\n";
@@ -283,4 +281,45 @@ int main(int argc, char** argv) {
 
   std::cout << "[INFO] Done. Output: " << outFile << "\n";
   return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc < 3) {
+    std::cerr << "Usage: " << argv[0] << " input_list.txt output_dir\n";
+    return 1;
+  }
+
+  const std::string listFile = argv[1];
+  const std::string outDir = argv[2];
+
+  std::filesystem::path outDirPath(outDir);
+  if (!std::filesystem::exists(outDirPath)) {
+    std::error_code ec;
+    if (!std::filesystem::create_directories(outDirPath, ec)) {
+      std::cerr << "[ERROR] Cannot create output directory: " << outDir
+                << " (" << ec.message() << ")\n";
+      return 6;
+    }
+  }
+
+  std::ifstream inList(listFile);
+  if (!inList) {
+    std::cerr << "[ERROR] Cannot open input list file: " << listFile << "\n";
+    return 7;
+  }
+
+  std::string inFile;
+  int ret = 0;
+  while (std::getline(inList, inFile)) {
+    if (inFile.empty()) {
+      continue;
+    }
+    const int code = ProcessFile(inFile, outDir);
+    if (code != 0) {
+      ret = code;
+      break;
+    }
+  }
+
+  return ret;
 }
