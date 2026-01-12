@@ -16,12 +16,14 @@
 
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
 #include <limits>
 #include <iostream>
 #include <string>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <cmath>
 
 struct TDC1Rec {
   Int_t tdc;
@@ -41,6 +43,7 @@ struct EventBuffers {
 
   // clean (hitnum==1 && edge==1)
   std::vector<int> ch, tdc;
+  std::vector<int> offset, tdc_cali;
   std::vector<int> clean_rawIndex;
   std::vector<unsigned char> isPaired;
 
@@ -63,7 +66,8 @@ struct EventBuffers {
 
   void reset() {
     ch_raw.clear(); tdc_raw.clear(); edge_raw.clear(); hitnum_raw.clear();
-    ch.clear(); tdc.clear(); clean_rawIndex.clear(); isPaired.clear();
+    ch.clear(); tdc.clear(); offset.clear(); tdc_cali.clear();
+    clean_rawIndex.clear(); isPaired.clear();
 
     hasLeft = false; hasRight = false;
     trigCategory = 0;
@@ -87,6 +91,61 @@ static long long CountEvtnumDrops(TTree* tin, TDC1Rec& rec) {
     prev = rec.evtnum;
   }
   return drops;
+}
+
+static std::vector<int> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
+  const int kMaxCh = 64;
+  std::vector<int> minVal(kMaxCh + 1, std::numeric_limits<int>::max());
+  std::vector<std::unordered_map<int, int>> counts(kMaxCh + 1);
+
+  const Long64_t n = tin->GetEntries();
+  for (Long64_t i = 0; i < n; ++i) {
+    tin->GetEntry(i);
+    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
+      minVal[rec.ch] = std::min(minVal[rec.ch], rec.tdc);
+      counts[rec.ch][rec.tdc]++;
+    }
+  }
+
+  std::vector<int> modeVal(kMaxCh + 1, 0);
+  for (int ch = 1; ch <= kMaxCh; ++ch) {
+    int bestCount = 0;
+    int bestTdc = 0;
+    for (const auto& kv : counts[ch]) {
+      if (kv.second > bestCount || (kv.second == bestCount && kv.first < bestTdc)) {
+        bestCount = kv.second;
+        bestTdc = kv.first;
+      }
+    }
+    modeVal[ch] = bestTdc;
+  }
+
+  std::vector<long long> sumVal(kMaxCh + 1, 0);
+  std::vector<long long> countVal(kMaxCh + 1, 0);
+  for (Long64_t i = 0; i < n; ++i) {
+    tin->GetEntry(i);
+    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
+      if (counts[rec.ch].empty()) {
+        continue;
+      }
+      const int minTdc = minVal[rec.ch];
+      const int modeTdc = modeVal[rec.ch];
+      const int maxTdc = 2 * modeTdc - minTdc;
+      if (rec.tdc >= minTdc && rec.tdc <= maxTdc) {
+        sumVal[rec.ch] += rec.tdc;
+        countVal[rec.ch] += 1;
+      }
+    }
+  }
+
+  std::vector<int> offsets(kMaxCh + 1, 0);
+  for (int ch = 1; ch <= kMaxCh; ++ch) {
+    if (countVal[ch] > 0) {
+      offsets[ch] = static_cast<int>(std::lround(
+        static_cast<double>(sumVal[ch]) / static_cast<double>(countVal[ch])));
+    }
+  }
+  return offsets;
 }
 
 static void FinalizeEvent(int evtnum, EventBuffers& ev) {
@@ -208,6 +267,8 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
 
   tout.Branch("ch", &ev.ch);
   tout.Branch("tdc", &ev.tdc);
+  tout.Branch("offset", &ev.offset);
+  tout.Branch("tdc_cali", &ev.tdc_cali);
   tout.Branch("clean_rawIndex", &ev.clean_rawIndex);
   tout.Branch("isPaired", &ev.isPaired);
 
@@ -224,6 +285,8 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
 
   tout.Branch("hasMultiHit", &ev.hasMultiHit);
   tout.Branch("nMultiHit", &ev.nMultiHit);
+
+  const std::vector<int> channelOffsets = ComputeChannelOffsets(tin, rec);
 
   // Streaming loop
   ev.reset();
@@ -264,6 +327,11 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     if (rec.hitnum == 1 && rec.edge == 1) {
       ev.ch.push_back(rec.ch);
       ev.tdc.push_back(rec.tdc);
+      const int offset = (rec.ch >= 1 && rec.ch < static_cast<int>(channelOffsets.size()))
+        ? channelOffsets[rec.ch]
+        : 0;
+      ev.offset.push_back(offset);
+      ev.tdc_cali.push_back(rec.tdc - offset);
       ev.clean_rawIndex.push_back(rawIndex);
     }
   }
