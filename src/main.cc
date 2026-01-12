@@ -181,12 +181,12 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
   }
   ev.isCoincidenceEvent = !pairedCh.empty();
 
-  // fastest (min tdc among CLEAN)
+  // fastest (min calibrated tdc among CLEAN)
   int bestT = std::numeric_limits<int>::max();
   int bestIdx = -1;
-  for (size_t i = 0; i < ev.tdc.size(); ++i) {
-    if (ev.tdc[i] < bestT) {
-      bestT = ev.tdc[i];
+  for (size_t i = 0; i < ev.tdc_cali.size(); ++i) {
+    if (ev.tdc_cali[i] < bestT) {
+      bestT = ev.tdc_cali[i];
       bestIdx = static_cast<int>(i);
     }
   }
