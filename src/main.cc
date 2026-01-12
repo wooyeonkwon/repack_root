@@ -43,7 +43,7 @@ struct EventBuffers {
 
   // clean (hitnum==1 && edge==1)
   std::vector<int> ch, tdc;
-  std::vector<int> offset, tdc_cali;
+  std::vector<double> offset, tdc_cali;
   std::vector<int> clean_rawIndex;
   std::vector<unsigned char> isPaired;
 
@@ -55,7 +55,7 @@ struct EventBuffers {
 
   // fastest
   int fast_ch = -1;
-  int fast_tdc = -1;
+  double fast_tdc = -1.0;
   int fast_cleanIndex = -1;
   int fast_rawIndex = -1;
   bool fast_isPaired = false;
@@ -73,7 +73,7 @@ struct EventBuffers {
     trigCategory = 0;
     isCoincidenceEvent = false;
 
-    fast_ch = -1; fast_tdc = -1;
+    fast_ch = -1; fast_tdc = -1.0;
     fast_cleanIndex = -1; fast_rawIndex = -1;
     fast_isPaired = false;
 
@@ -93,7 +93,7 @@ static long long CountEvtnumDrops(TTree* tin, TDC1Rec& rec) {
   return drops;
 }
 
-static std::vector<int> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
+static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
   const int kMaxCh = 64;
   std::vector<int> minVal(kMaxCh + 1, std::numeric_limits<int>::max());
   std::vector<std::unordered_map<int, int>> counts(kMaxCh + 1);
@@ -138,11 +138,10 @@ static std::vector<int> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
     }
   }
 
-  std::vector<int> offsets(kMaxCh + 1, 0);
+  std::vector<double> offsets(kMaxCh + 1, 0.0);
   for (int ch = 1; ch <= kMaxCh; ++ch) {
     if (countVal[ch] > 0) {
-      offsets[ch] = static_cast<int>(std::lround(
-        static_cast<double>(sumVal[ch]) / static_cast<double>(countVal[ch])));
+      offsets[ch] = static_cast<double>(sumVal[ch]) / static_cast<double>(countVal[ch]);
     }
   }
   return offsets;
@@ -182,7 +181,7 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
   ev.isCoincidenceEvent = !pairedCh.empty();
 
   // fastest (min calibrated tdc among CLEAN)
-  int bestT = std::numeric_limits<int>::max();
+  double bestT = std::numeric_limits<double>::max();
   int bestIdx = -1;
   for (size_t i = 0; i < ev.tdc_cali.size(); ++i) {
     if (ev.tdc_cali[i] < bestT) {
@@ -194,13 +193,13 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
   if (bestIdx >= 0) {
     ev.fast_cleanIndex = bestIdx;
     ev.fast_ch = ev.ch[bestIdx];
-    ev.fast_tdc = ev.tdc[bestIdx];
+    ev.fast_tdc = static_cast<double>(ev.tdc[bestIdx]);
     ev.fast_rawIndex = ev.clean_rawIndex[bestIdx];
     ev.fast_isPaired = (ev.isPaired[bestIdx] != 0);
   } else {
     ev.fast_cleanIndex = -1;
     ev.fast_ch = -1;
-    ev.fast_tdc = -1;
+    ev.fast_tdc = -1.0;
     ev.fast_rawIndex = -1;
     ev.fast_isPaired = false;
   }
@@ -286,7 +285,7 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   tout.Branch("hasMultiHit", &ev.hasMultiHit);
   tout.Branch("nMultiHit", &ev.nMultiHit);
 
-  const std::vector<int> channelOffsets = ComputeChannelOffsets(tin, rec);
+  const std::vector<double> channelOffsets = ComputeChannelOffsets(tin, rec);
 
   // Streaming loop
   ev.reset();
@@ -327,11 +326,11 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     if (rec.hitnum == 1 && rec.edge == 1) {
       ev.ch.push_back(rec.ch);
       ev.tdc.push_back(rec.tdc);
-      const int offset = (rec.ch >= 1 && rec.ch < static_cast<int>(channelOffsets.size()))
+      const double offset = (rec.ch >= 1 && rec.ch < static_cast<int>(channelOffsets.size()))
         ? channelOffsets[rec.ch]
-        : 0;
+        : 0.0;
       ev.offset.push_back(offset);
-      ev.tdc_cali.push_back(rec.tdc - offset);
+      ev.tdc_cali.push_back(static_cast<double>(rec.tdc) - offset);
       ev.clean_rawIndex.push_back(rawIndex);
     }
   }
