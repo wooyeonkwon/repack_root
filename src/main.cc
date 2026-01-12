@@ -193,7 +193,7 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
   if (bestIdx >= 0) {
     ev.fast_cleanIndex = bestIdx;
     ev.fast_ch = ev.ch[bestIdx];
-    ev.fast_tdc = static_cast<double>(ev.tdc[bestIdx]);
+    ev.fast_tdc = ev.tdc_cali[bestIdx];
     ev.fast_rawIndex = ev.clean_rawIndex[bestIdx];
     ev.fast_isPaired = (ev.isPaired[bestIdx] != 0);
   } else {
