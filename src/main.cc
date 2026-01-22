@@ -3,7 +3,7 @@
 //   g++ -O2 -std=c++17 main.cc `root-config --cflags --libs` -o repack_root
 //
 // Run:
-//   ./repack_root input.root output.root
+//   ./repack_root input_list.txt output_dir
 //
 // Policy:
 //   - clean = (hitnum==1 && edge==1)  [leading only]
@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 
 struct TDC1Rec {
   Int_t tdc;
@@ -76,18 +77,6 @@ struct EventBuffers {
     hasMultiHit = false; nMultiHit = 0;
   }
 };
-
-static long long CountEvtnumDrops(TTree* tin, TDC1Rec& rec) {
-  const Long64_t n = tin->GetEntries();
-  int prev = -1;
-  long long drops = 0;
-  for (Long64_t i = 0; i < n; ++i) {
-    tin->GetEntry(i);
-    if (prev != -1 && rec.evtnum < prev) drops++;
-    prev = rec.evtnum;
-  }
-  return drops;
-}
 
 static void FinalizeEvent(int evtnum, EventBuffers& ev) {
   // hasLeft/hasRight from CLEAN
@@ -148,32 +137,14 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
 }
 
 static int ProcessFile(const std::string& inFile, const std::string& outDir) {
-  const std::filesystem::path outPath = std::filesystem::path(outDir)
-                                        / std::filesystem::path(inFile).filename();
+  std::filesystem::path outPath = std::filesystem::path(outDir)
+                                  / std::filesystem::path(inFile).filename();
+  outPath.replace_extension(".root");
 
-  TFile fin(inFile.c_str(), "READ");
-  if (fin.IsZombie()) {
+  std::ifstream fin(inFile);
+  if (!fin) {
     std::cerr << "[ERROR] Cannot open input file: " << inFile << "\n";
     return 2;
-  }
-
-  TTree* tin = (TTree*)fin.Get("tree_TDC1");
-  if (!tin) {
-    std::cerr << "[ERROR] tree_TDC1 not found\n";
-    return 3;
-  }
-
-  TDC1Rec rec;
-  if (tin->SetBranchAddress("TDC1", &rec) < 0) {
-    std::cerr << "[ERROR] SetBranchAddress(\"TDC1\") failed\n";
-    return 4;
-  }
-
-  // Check monotonicity (informational)
-  const long long drops = CountEvtnumDrops(tin, rec);
-  if (drops > 0) {
-    std::cerr << "[WARN] evtnum is not monotonic (drops=" << drops
-              << "). Streaming grouping may break.\n";
   }
 
   // Output
@@ -184,12 +155,9 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     return 5;
   }
 
-  // Clone header tree if exists
-  if (TTree* head = (TTree*)fin.Get("head_TDC1")) {
-    fout.cd();
-    TTree* headOut = head->CloneTree(-1, "fast");
-    headOut->Write("head_TDC1");
-  }
+  int ntrig_max = 0;
+  TTree head("head_TDC1", "head_TDC1");
+  head.Branch("NtrigMax", &ntrig_max);
 
   // Events Tree
   fout.cd();
@@ -228,10 +196,32 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   // Streaming loop
   ev.reset();
   int curEvt = -1;
+  int prevEvt = -1;
+  long long drops = 0;
+  std::string line;
+  long long lineNo = 0;
+  while (std::getline(fin, line)) {
+    ++lineNo;
+    if (line.empty()) {
+      continue;
+    }
+    std::istringstream iss(line);
+    TDC1Rec rec{};
+    int ntrig = 0;
+    if (!(iss >> ntrig >> rec.evtnum >> rec.ch >> rec.hitnum >> rec.tdc)) {
+      std::cerr << "[ERROR] Failed to parse line " << lineNo << " in " << inFile
+                << "\n";
+      return 8;
+    }
+    rec.edge = 1;
+    if (ntrig > ntrig_max) {
+      ntrig_max = ntrig;
+    }
 
-  const Long64_t nEnt = tin->GetEntries();
-  for (Long64_t i = 0; i < nEnt; ++i) {
-    tin->GetEntry(i);
+    if (prevEvt != -1 && rec.evtnum < prevEvt) {
+      drops++;
+    }
+    prevEvt = rec.evtnum;
 
     if (curEvt == -1) curEvt = rec.evtnum;
 
@@ -268,6 +258,11 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     }
   }
 
+  if (drops > 0) {
+    std::cerr << "[WARN] evtnum is not monotonic (drops=" << drops
+              << "). Streaming grouping may break.\n";
+  }
+
   // last event
   if (curEvt != -1) {
     FinalizeEvent(curEvt, ev);
@@ -275,9 +270,10 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     tout.Fill();
   }
 
+  head.Fill();
+  head.Write("head_TDC1");
   fout.Write();
   fout.Close();
-  fin.Close();
 
   std::cout << "[INFO] Done. Output: " << outFile << "\n";
   return 0;
