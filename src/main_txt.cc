@@ -43,6 +43,7 @@ struct EventBuffers {
 
   // clean (hitnum==1 && edge==1)
   std::vector<int> ch, tdc;
+  std::vector<int> tdc_cali;
   std::vector<int> clean_rawIndex;
   std::vector<unsigned char> isPaired;
 
@@ -65,7 +66,7 @@ struct EventBuffers {
 
   void reset() {
     ch_raw.clear(); tdc_raw.clear(); edge_raw.clear(); hitnum_raw.clear();
-    ch.clear(); tdc.clear(); clean_rawIndex.clear(); isPaired.clear();
+    ch.clear(); tdc.clear(); tdc_cali.clear(); clean_rawIndex.clear(); isPaired.clear();
 
     hasLeft = false; hasRight = false;
     trigCategory = 0;
@@ -128,12 +129,17 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
     ev.fast_tdc = ev.tdc[bestIdx];
     ev.fast_rawIndex = ev.clean_rawIndex[bestIdx];
     ev.fast_isPaired = (ev.isPaired[bestIdx] != 0);
+    ev.tdc_cali.resize(ev.tdc.size());
+    for (size_t i = 0; i < ev.tdc.size(); ++i) {
+      ev.tdc_cali[i] = ev.tdc[i] - ev.fast_tdc;
+    }
   } else {
     ev.fast_cleanIndex = -1;
     ev.fast_ch = -1;
     ev.fast_tdc = -1;
     ev.fast_rawIndex = -1;
     ev.fast_isPaired = false;
+    ev.tdc_cali.clear();
   }
 }
 
@@ -177,6 +183,7 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
 
   tout.Branch("ch", &ev.ch);
   tout.Branch("tdc", &ev.tdc);
+  tout.Branch("tdc_cali", &ev.tdc_cali);
   tout.Branch("clean_rawIndex", &ev.clean_rawIndex);
   tout.Branch("isPaired", &ev.isPaired);
 
