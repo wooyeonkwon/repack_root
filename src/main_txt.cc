@@ -247,8 +247,9 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   std::sort(evtnums.begin(), evtnums.end());
 
   for (int evtnum : evtnums) {
-    EventBuffers& curEvent = events[evtnum];
-    FinalizeEvent(evtnum, curEvent);
+    const EventBuffers& curEvent = events[evtnum];
+    ev = curEvent;
+    FinalizeEvent(evtnum, ev);
     o_evtnum = evtnum;
     tout.Fill();
   }
