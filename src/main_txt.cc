@@ -124,6 +124,7 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
   }
 
   if (bestIdx >= 0) {
+    const int ref_tdc = ev.tdc.front();
     ev.fast_cleanIndex = bestIdx;
     ev.fast_ch = ev.ch[bestIdx];
     ev.fast_tdc = ev.tdc[bestIdx];
@@ -131,7 +132,7 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
     ev.fast_isPaired = (ev.isPaired[bestIdx] != 0);
     ev.tdc_cali.resize(ev.tdc.size());
     for (size_t i = 0; i < ev.tdc.size(); ++i) {
-      ev.tdc_cali[i] = ev.tdc[i] - ev.fast_tdc;
+      ev.tdc_cali[i] = ev.tdc[i] - ref_tdc;
     }
   } else {
     ev.fast_cleanIndex = -1;
