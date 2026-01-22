@@ -15,6 +15,7 @@
 #include <TTree.h>
 
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
 #include <limits>
 #include <iostream>
@@ -194,10 +195,8 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   tout.Branch("nMultiHit", &ev.nMultiHit);
 
   // Streaming loop
-  ev.reset();
-  int curEvt = -1;
-  int prevEvt = -1;
-  long long drops = 0;
+  std::unordered_map<int, EventBuffers> events;
+  events.reserve(4096);
   std::string line;
   long long lineNo = 0;
   while (std::getline(fin, line)) {
@@ -217,56 +216,40 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     if (ntrig > ntrig_max) {
       ntrig_max = ntrig;
     }
-
-    if (prevEvt != -1 && rec.evtnum < prevEvt) {
-      drops++;
-    }
-    prevEvt = rec.evtnum;
-
-    if (curEvt == -1) curEvt = rec.evtnum;
-
-    // event boundary
-    if (rec.evtnum != curEvt) {
-      // finalize + fill
-      FinalizeEvent(curEvt, ev);
-      o_evtnum = curEvt;
-      tout.Fill();
-
-      // reset for next
-      ev.reset();
-      curEvt = rec.evtnum;
-    }
+    EventBuffers& curEvent = events[rec.evtnum];
 
     // push raw
-    const int rawIndex = static_cast<int>(ev.ch_raw.size());
-    ev.ch_raw.push_back(rec.ch);
-    ev.tdc_raw.push_back(rec.tdc);
-    ev.edge_raw.push_back(rec.edge);
-    ev.hitnum_raw.push_back(rec.hitnum);
+    const int rawIndex = static_cast<int>(curEvent.ch_raw.size());
+    curEvent.ch_raw.push_back(rec.ch);
+    curEvent.tdc_raw.push_back(rec.tdc);
+    curEvent.edge_raw.push_back(rec.edge);
+    curEvent.hitnum_raw.push_back(rec.hitnum);
 
     // QA
     if (rec.hitnum > 1) {
-      ev.hasMultiHit = true;
-      ev.nMultiHit++;
+      curEvent.hasMultiHit = true;
+      curEvent.nMultiHit++;
     }
 
     // push clean (hitnum==1 && edge==1)
     if (rec.hitnum == 1 && rec.edge == 1) {
-      ev.ch.push_back(rec.ch);
-      ev.tdc.push_back(rec.tdc);
-      ev.clean_rawIndex.push_back(rawIndex);
+      curEvent.ch.push_back(rec.ch);
+      curEvent.tdc.push_back(rec.tdc);
+      curEvent.clean_rawIndex.push_back(rawIndex);
     }
   }
 
-  if (drops > 0) {
-    std::cerr << "[WARN] evtnum is not monotonic (drops=" << drops
-              << "). Streaming grouping may break.\n";
+  std::vector<int> evtnums;
+  evtnums.reserve(events.size());
+  for (const auto& entry : events) {
+    evtnums.push_back(entry.first);
   }
+  std::sort(evtnums.begin(), evtnums.end());
 
-  // last event
-  if (curEvt != -1) {
-    FinalizeEvent(curEvt, ev);
-    o_evtnum = curEvt;
+  for (int evtnum : evtnums) {
+    EventBuffers& curEvent = events[evtnum];
+    FinalizeEvent(evtnum, curEvent);
+    o_evtnum = evtnum;
     tout.Fill();
   }
 
