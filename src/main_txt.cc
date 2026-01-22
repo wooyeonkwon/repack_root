@@ -207,12 +207,14 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     std::istringstream iss(line);
     TDC1Rec rec{};
     int ntrig = 0;
-    if (!(iss >> ntrig >> rec.evtnum >> rec.ch >> rec.hitnum >> rec.tdc)) {
+    int hitnum_input = 0;
+    if (!(iss >> ntrig >> rec.evtnum >> rec.ch >> hitnum_input >> rec.tdc)) {
       std::cerr << "[ERROR] Failed to parse line " << lineNo << " in " << inFile
                 << "\n";
       return 8;
     }
     rec.edge = 1;
+    rec.hitnum = hitnum_input + 1;
     if (ntrig > ntrig_max) {
       ntrig_max = ntrig;
     }
