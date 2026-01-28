@@ -34,6 +34,7 @@ struct Head1Rec {
   Int_t range;
   Int_t delay;
   Int_t mask[64];
+  Int_t NtrigMax;
 };
 
 static void FillDefaultHead(Head1Rec& head) {
@@ -42,6 +43,7 @@ static void FillDefaultHead(Head1Rec& head) {
   head.rmode = 1;
   head.range = 2;
   head.delay = 100;
+  head.NtrigMax = 0;
   const int mask_values[64] = {
     1, 1, 1, 1, 1, 1, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -78,10 +80,9 @@ static int ConvertTxtToRoot(const std::string& inFile, const std::string& outDir
   Head1Rec head{};
   FillDefaultHead(head);
   TTree headTree("head_TDC1", "Head of Run - TDC1");
-  headTree.Branch("head1", &head,
-                  "gmode/I:emode/I:rmode/I:range/I:delay/I:mask[64]/I");
-  headTree.Fill();
-  headTree.Write("head_TDC1");
+  headTree.Branch(
+      "head1", &head,
+      "gmode/I:emode/I:rmode/I:range/I:delay/I:mask[64]/I:NtrigMax/I");
 
   TTree dataTree("tree_TDC1", "TDC1 data");
   TDC1Rec rec{};
@@ -89,6 +90,8 @@ static int ConvertTxtToRoot(const std::string& inFile, const std::string& outDir
 
   std::string line;
   long long lineNo = 0;
+  int lastNtrig = 0;
+  bool hasNtrig = false;
   while (std::getline(fin, line)) {
     ++lineNo;
     if (line.empty()) {
@@ -104,8 +107,16 @@ static int ConvertTxtToRoot(const std::string& inFile, const std::string& outDir
     }
     rec.edge = 1;
     rec.hitnum = hitnum_input + 1;
+    lastNtrig = ntrig;
+    hasNtrig = true;
     dataTree.Fill();
   }
+
+  if (hasNtrig) {
+    head.NtrigMax = lastNtrig;
+  }
+  headTree.Fill();
+  headTree.Write("head_TDC1");
 
   fout.Write();
   fout.Close();
