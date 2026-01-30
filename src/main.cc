@@ -96,28 +96,32 @@ static long long CountEvtnumDrops(TTree* tin, TDC1Rec& rec) {
 static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
   const int kMaxCh = 64;
   std::vector<int> minVal(kMaxCh + 1, std::numeric_limits<int>::max());
-  std::vector<std::unordered_map<int, int>> counts(kMaxCh + 1);
+  std::vector<std::vector<int>> values(kMaxCh + 1);
 
   const Long64_t n = tin->GetEntries();
   for (Long64_t i = 0; i < n; ++i) {
     tin->GetEntry(i);
     if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
       minVal[rec.ch] = std::min(minVal[rec.ch], rec.tdc);
-      counts[rec.ch][rec.tdc]++;
+      values[rec.ch].push_back(rec.tdc);
     }
   }
 
-  std::vector<int> modeVal(kMaxCh + 1, 0);
+  std::vector<double> medianVal(kMaxCh + 1, 0.0);
   for (int ch = 1; ch <= kMaxCh; ++ch) {
-    int bestCount = 0;
-    int bestTdc = 0;
-    for (const auto& kv : counts[ch]) {
-      if (kv.second > bestCount || (kv.second == bestCount && kv.first < bestTdc)) {
-        bestCount = kv.second;
-        bestTdc = kv.first;
-      }
+    if (values[ch].empty()) {
+      continue;
     }
-    modeVal[ch] = bestTdc;
+    auto& vals = values[ch];
+    const size_t mid = vals.size() / 2;
+    std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+    double median = static_cast<double>(vals[mid]);
+    if (vals.size() % 2 == 0) {
+      const int upper = vals[mid];
+      const int lower = *std::max_element(vals.begin(), vals.begin() + mid);
+      median = (static_cast<double>(lower) + static_cast<double>(upper)) / 2.0;
+    }
+    medianVal[ch] = median;
   }
 
   std::vector<long long> sumVal(kMaxCh + 1, 0);
@@ -125,13 +129,14 @@ static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
   for (Long64_t i = 0; i < n; ++i) {
     tin->GetEntry(i);
     if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
-      if (counts[rec.ch].empty()) {
+      if (values[rec.ch].empty()) {
         continue;
       }
       const int minTdc = minVal[rec.ch];
-      const int modeTdc = modeVal[rec.ch];
-      const int maxTdc = 2 * modeTdc - minTdc;
-      if (rec.tdc >= minTdc && rec.tdc <= maxTdc) {
+      const double medianTdc = medianVal[rec.ch];
+      const double maxTdc = 2.0 * medianTdc - static_cast<double>(minTdc);
+      if (static_cast<double>(rec.tdc) >= static_cast<double>(minTdc)
+          && static_cast<double>(rec.tdc) <= maxTdc) {
         sumVal[rec.ch] += rec.tdc;
         countVal[rec.ch] += 1;
       }
