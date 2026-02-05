@@ -95,33 +95,33 @@ static long long CountEvtnumDrops(TTree* tin, TDC1Rec& rec) {
 
 static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
   const int kMaxCh = 64;
+  const int kModeBinWidth = 1000;
   std::vector<int> minVal(kMaxCh + 1, std::numeric_limits<int>::max());
-  std::vector<std::vector<int>> values(kMaxCh + 1);
+  std::vector<std::unordered_map<int, int>> binCounts(kMaxCh + 1);
 
   const Long64_t n = tin->GetEntries();
   for (Long64_t i = 0; i < n; ++i) {
     tin->GetEntry(i);
     if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
       minVal[rec.ch] = std::min(minVal[rec.ch], rec.tdc);
-      values[rec.ch].push_back(rec.tdc);
+      const int binIdx = rec.tdc / kModeBinWidth;
+      binCounts[rec.ch][binIdx]++;
     }
   }
 
-  std::vector<double> medianVal(kMaxCh + 1, 0.0);
+  std::vector<double> modeVal(kMaxCh + 1, 0.0);
   for (int ch = 1; ch <= kMaxCh; ++ch) {
-    if (values[ch].empty()) {
-      continue;
+    int bestCount = 0;
+    int bestBinIdx = 0;
+    for (const auto& kv : binCounts[ch]) {
+      if (kv.second > bestCount || (kv.second == bestCount && kv.first < bestBinIdx)) {
+        bestCount = kv.second;
+        bestBinIdx = kv.first;
+      }
     }
-    auto& vals = values[ch];
-    const size_t mid = vals.size() / 2;
-    std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
-    double median = static_cast<double>(vals[mid]);
-    if (vals.size() % 2 == 0) {
-      const int upper = vals[mid];
-      const int lower = *std::max_element(vals.begin(), vals.begin() + mid);
-      median = (static_cast<double>(lower) + static_cast<double>(upper)) / 2.0;
+    if (bestCount > 0) {
+      modeVal[ch] = static_cast<double>(bestBinIdx * kModeBinWidth + (kModeBinWidth / 2));
     }
-    medianVal[ch] = median;
   }
 
   std::vector<long long> sumVal(kMaxCh + 1, 0);
@@ -129,12 +129,12 @@ static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
   for (Long64_t i = 0; i < n; ++i) {
     tin->GetEntry(i);
     if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
-      if (values[rec.ch].empty()) {
+      if (binCounts[rec.ch].empty()) {
         continue;
       }
       const int minTdc = minVal[rec.ch];
-      const double medianTdc = medianVal[rec.ch];
-      const double maxTdc = 2.0 * medianTdc - static_cast<double>(minTdc);
+      const double modeTdc = modeVal[rec.ch];
+      const double maxTdc = 2.0 * modeTdc - static_cast<double>(minTdc);
       if (static_cast<double>(rec.tdc) >= static_cast<double>(minTdc)
           && static_cast<double>(rec.tdc) <= maxTdc) {
         sumVal[rec.ch] += rec.tdc;
