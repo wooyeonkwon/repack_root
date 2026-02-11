@@ -46,6 +46,7 @@ struct EventBuffers {
   std::vector<double> offset, tdc_cali;
   std::vector<int> clean_rawIndex;
   std::vector<unsigned char> isPaired;
+  std::vector<int> pairIdx;
 
   // flags
   bool hasLeft = false;
@@ -67,7 +68,7 @@ struct EventBuffers {
   void reset() {
     ch_raw.clear(); tdc_raw.clear(); edge_raw.clear(); hitnum_raw.clear();
     ch.clear(); tdc.clear(); offset.clear(); tdc_cali.clear();
-    clean_rawIndex.clear(); isPaired.clear();
+    clean_rawIndex.clear(); isPaired.clear(); pairIdx.clear();
 
     hasLeft = false; hasRight = false;
     trigCategory = 0;
@@ -96,17 +97,146 @@ static long long CountEvtnumDrops(TTree* tin, TDC1Rec& rec) {
 static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
   const int kMaxCh = 64;
   const int kModeBinWidth = 1000;
-  std::vector<int> minVal(kMaxCh + 1, std::numeric_limits<int>::max());
-  std::vector<std::unordered_map<int, int>> binCounts(kMaxCh + 1);
+  const int kPairCountTarget = 2;
+
+  struct CleanHit {
+    int ch;
+    int tdc;
+  };
+
+  struct PairSumData {
+    std::vector<int> sums;
+    std::unordered_map<int, int> chToPairSum;
+  };
+
+  auto BuildPairSumData = [&](const std::vector<CleanHit>& hits) {
+    PairSumData out;
+    std::unordered_map<int, int> chToTdc;
+    chToTdc.reserve(hits.size());
+    for (const CleanHit& h : hits) {
+      chToTdc.emplace(h.ch, h.tdc);
+    }
+
+    for (const auto& kv : chToTdc) {
+      const int ch = kv.first;
+      const int opp = OppChannel(ch);
+      if (ch >= opp) {
+        continue;
+      }
+      auto itOpp = chToTdc.find(opp);
+      if (itOpp == chToTdc.end()) {
+        continue;
+      }
+      const int tdcSum = kv.second + itOpp->second;
+      out.sums.push_back(tdcSum);
+      out.chToPairSum[ch] = tdcSum;
+      out.chToPairSum[opp] = tdcSum;
+    }
+    return out;
+  };
+
+  std::vector<std::vector<int>> eventPairSums;
+  std::vector<int> allPairSums;
+  eventPairSums.reserve(1024);
+  allPairSums.reserve(4096);
+
+  std::vector<CleanHit> eventHits;
+  eventHits.reserve(64);
+  int curEvt = -1;
 
   const Long64_t n = tin->GetEntries();
   for (Long64_t i = 0; i < n; ++i) {
     tin->GetEntry(i);
-    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
-      minVal[rec.ch] = std::min(minVal[rec.ch], rec.tdc);
-      const int binIdx = rec.tdc / kModeBinWidth;
-      binCounts[rec.ch][binIdx]++;
+    if (curEvt == -1) {
+      curEvt = rec.evtnum;
     }
+    if (rec.evtnum != curEvt) {
+      PairSumData pairData = BuildPairSumData(eventHits);
+      eventPairSums.push_back(pairData.sums);
+      allPairSums.insert(allPairSums.end(), pairData.sums.begin(), pairData.sums.end());
+      eventHits.clear();
+      curEvt = rec.evtnum;
+    }
+    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
+      eventHits.push_back({rec.ch, rec.tdc});
+    }
+  }
+  if (curEvt != -1) {
+    PairSumData pairData = BuildPairSumData(eventHits);
+    eventPairSums.push_back(pairData.sums);
+    allPairSums.insert(allPairSums.end(), pairData.sums.begin(), pairData.sums.end());
+  }
+
+  int selectedThreshold = std::numeric_limits<int>::max();
+  if (!allPairSums.empty()) {
+    std::sort(allPairSums.begin(), allPairSums.end());
+    allPairSums.erase(std::unique(allPairSums.begin(), allPairSums.end()), allPairSums.end());
+    std::sort(allPairSums.rbegin(), allPairSums.rend());
+
+    long long bestEventCount = -1;
+    int bestThreshold = allPairSums.front();
+    for (const int threshold : allPairSums) {
+      long long eventCountWithTarget = 0;
+      for (const auto& sums : eventPairSums) {
+        int matched = 0;
+        for (const int v : sums) {
+          if (v < threshold) {
+            matched++;
+          }
+        }
+        if (matched == kPairCountTarget) {
+          eventCountWithTarget++;
+        }
+      }
+      if (eventCountWithTarget > bestEventCount
+          || (eventCountWithTarget == bestEventCount && threshold > bestThreshold)) {
+        bestEventCount = eventCountWithTarget;
+        bestThreshold = threshold;
+      }
+    }
+    selectedThreshold = bestThreshold;
+  }
+
+  std::vector<int> minVal(kMaxCh + 1, std::numeric_limits<int>::max());
+  std::vector<std::unordered_map<int, int>> binCounts(kMaxCh + 1);
+
+  auto accumulateEventForMode = [&](const std::vector<CleanHit>& hits) {
+    if (hits.empty()) {
+      return;
+    }
+    PairSumData pairData = BuildPairSumData(hits);
+    for (const CleanHit& h : hits) {
+      auto it = pairData.chToPairSum.find(h.ch);
+      if (it == pairData.chToPairSum.end()) {
+        continue;
+      }
+      if (it->second >= selectedThreshold) {
+        continue;
+      }
+      minVal[h.ch] = std::min(minVal[h.ch], h.tdc);
+      const int binIdx = h.tdc / kModeBinWidth;
+      binCounts[h.ch][binIdx]++;
+    }
+  };
+
+  eventHits.clear();
+  curEvt = -1;
+  for (Long64_t i = 0; i < n; ++i) {
+    tin->GetEntry(i);
+    if (curEvt == -1) {
+      curEvt = rec.evtnum;
+    }
+    if (rec.evtnum != curEvt) {
+      accumulateEventForMode(eventHits);
+      eventHits.clear();
+      curEvt = rec.evtnum;
+    }
+    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
+      eventHits.push_back({rec.ch, rec.tdc});
+    }
+  }
+  if (curEvt != -1) {
+    accumulateEventForMode(eventHits);
   }
 
   std::vector<double> modeVal(kMaxCh + 1, 0.0);
@@ -126,21 +256,51 @@ static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
 
   std::vector<long long> sumVal(kMaxCh + 1, 0);
   std::vector<long long> countVal(kMaxCh + 1, 0);
-  for (Long64_t i = 0; i < n; ++i) {
-    tin->GetEntry(i);
-    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
-      if (binCounts[rec.ch].empty()) {
+  auto accumulateEventForAverage = [&](const std::vector<CleanHit>& hits) {
+    if (hits.empty()) {
+      return;
+    }
+    PairSumData pairData = BuildPairSumData(hits);
+    for (const CleanHit& h : hits) {
+      auto it = pairData.chToPairSum.find(h.ch);
+      if (it == pairData.chToPairSum.end()) {
         continue;
       }
-      const int minTdc = minVal[rec.ch];
-      const double modeTdc = modeVal[rec.ch];
+      if (it->second >= selectedThreshold) {
+        continue;
+      }
+      if (binCounts[h.ch].empty()) {
+        continue;
+      }
+      const int minTdc = minVal[h.ch];
+      const double modeTdc = modeVal[h.ch];
       const double maxTdc = 2.0 * modeTdc - static_cast<double>(minTdc);
-      if (static_cast<double>(rec.tdc) >= static_cast<double>(minTdc)
-          && static_cast<double>(rec.tdc) <= maxTdc) {
-        sumVal[rec.ch] += rec.tdc;
-        countVal[rec.ch] += 1;
+      if (static_cast<double>(h.tdc) >= static_cast<double>(minTdc)
+          && static_cast<double>(h.tdc) <= maxTdc) {
+        sumVal[h.ch] += h.tdc;
+        countVal[h.ch] += 1;
       }
     }
+  };
+
+  eventHits.clear();
+  curEvt = -1;
+  for (Long64_t i = 0; i < n; ++i) {
+    tin->GetEntry(i);
+    if (curEvt == -1) {
+      curEvt = rec.evtnum;
+    }
+    if (rec.evtnum != curEvt) {
+      accumulateEventForAverage(eventHits);
+      eventHits.clear();
+      curEvt = rec.evtnum;
+    }
+    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
+      eventHits.push_back({rec.ch, rec.tdc});
+    }
+  }
+  if (curEvt != -1) {
+    accumulateEventForAverage(eventHits);
   }
 
   std::vector<double> offsets(kMaxCh + 1, 0.0);
@@ -178,9 +338,22 @@ static void FinalizeEvent(int evtnum, EventBuffers& ev) {
   }
 
   ev.isPaired.assign(ev.ch.size(), 0);
+  ev.pairIdx.assign(ev.ch.size(), -1);
+  std::unordered_map<int, int> chToCleanIdx;
+  chToCleanIdx.reserve(ev.ch.size());
+  for (size_t i = 0; i < ev.ch.size(); ++i) {
+    chToCleanIdx.emplace(ev.ch[i], static_cast<int>(i));
+  }
   if (!pairedCh.empty()) {
     for (size_t i = 0; i < ev.ch.size(); ++i) {
-      if (pairedCh.find(ev.ch[i]) != pairedCh.end()) ev.isPaired[i] = 1;
+      if (pairedCh.find(ev.ch[i]) != pairedCh.end()) {
+        ev.isPaired[i] = 1;
+        const int opp = OppChannel(ev.ch[i]);
+        auto itPair = chToCleanIdx.find(opp);
+        if (itPair != chToCleanIdx.end()) {
+          ev.pairIdx[i] = itPair->second;
+        }
+      }
     }
   }
   ev.isCoincidenceEvent = !pairedCh.empty();
@@ -275,6 +448,7 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   tout.Branch("tdc_cali", &ev.tdc_cali);
   tout.Branch("clean_rawIndex", &ev.clean_rawIndex);
   tout.Branch("isPaired", &ev.isPaired);
+  tout.Branch("pairIdx", &ev.pairIdx);
 
   tout.Branch("hasLeft", &ev.hasLeft);
   tout.Branch("hasRight", &ev.hasRight);
