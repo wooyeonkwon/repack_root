@@ -97,7 +97,8 @@ static long long CountEvtnumDrops(TTree* tin, TDC1Rec& rec) {
 static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
   const int kMaxCh = 64;
   const int kModeBinWidth = 1000;
-  const int kPairCountTarget = 2;
+  const int kPairHitCountTarget = 2;
+  const int kPairCountTarget = kPairHitCountTarget / 2;
 
   struct CleanHit {
     int ch;
@@ -207,6 +208,7 @@ static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
         matched++;
       }
     }
+    // matched counts pair-sums (one value per pair), so target is 1 pair (=2 hits).
     return matched == kPairCountTarget;
   };
 
