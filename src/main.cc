@@ -200,11 +200,24 @@ static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
   std::vector<int> minVal(kMaxCh + 1, std::numeric_limits<int>::max());
   std::vector<std::unordered_map<int, int>> binCounts(kMaxCh + 1);
 
+  auto IsTargetEvent = [&](const PairSumData& pairData) {
+    int matched = 0;
+    for (const int v : pairData.sums) {
+      if (v < selectedThreshold) {
+        matched++;
+      }
+    }
+    return matched == kPairCountTarget;
+  };
+
   auto accumulateEventForMode = [&](const std::vector<CleanHit>& hits) {
     if (hits.empty()) {
       return;
     }
     PairSumData pairData = BuildPairSumData(hits);
+    if (!IsTargetEvent(pairData)) {
+      return;
+    }
     for (const CleanHit& h : hits) {
       auto it = pairData.chToPairSum.find(h.ch);
       if (it == pairData.chToPairSum.end()) {
@@ -261,6 +274,9 @@ static std::vector<double> ComputeChannelOffsets(TTree* tin, TDC1Rec& rec) {
       return;
     }
     PairSumData pairData = BuildPairSumData(hits);
+    if (!IsTargetEvent(pairData)) {
+      return;
+    }
     for (const CleanHit& h : hits) {
       auto it = pairData.chToPairSum.find(h.ch);
       if (it == pairData.chToPairSum.end()) {
