@@ -1,6 +1,6 @@
 //
 // Build:
-//   g++ -O2 -std=c++17 main_custum_offset.cc `root-config --cflags --libs` -o repack_root_custom_offset
+//   g++ -O2 -std=c++17 main_custom_offset.cc `root-config --cflags --libs` -o repack_root_custom_offset
 //
 // Run:
 //   ./repack_root_custom_offset input_list.txt output_dir offset_config.json
@@ -96,8 +96,10 @@ static long long CountEvtnumDrops(TTree* tin, TDC1Rec& rec) {
 }
 
 struct OffsetConfig {
-  double thresholdUpper = std::numeric_limits<double>::max();
-  double thresholdLower = std::numeric_limits<double>::lowest();
+  double thresholdUpperLeft = std::numeric_limits<double>::max();
+  double thresholdLowerLeft = std::numeric_limits<double>::lowest();
+  double thresholdUpperRight = std::numeric_limits<double>::max();
+  double thresholdLowerRight = std::numeric_limits<double>::lowest();
   std::vector<double> offsets;
 };
 
@@ -136,9 +138,45 @@ static bool LoadOffsetConfig(const std::string& jsonFile, OffsetConfig& cfg) {
   const std::string text((std::istreambuf_iterator<char>(fin)),
                          std::istreambuf_iterator<char>());
 
-  if (!ParseSingleNumber(text, "threshold_upper", cfg.thresholdUpper)
-      || !ParseSingleNumber(text, "threshold_lower", cfg.thresholdLower)) {
-    std::cerr << "[ERROR] Invalid json format: threshold_upper/lower is missing\n";
+  double commonUpper = 0.0;
+  double commonLower = 0.0;
+  const bool hasCommonUpper = ParseSingleNumber(text, "threshold_upper", commonUpper);
+  const bool hasCommonLower = ParseSingleNumber(text, "threshold_lower", commonLower);
+
+  if (hasCommonUpper != hasCommonLower) {
+    std::cerr << "[ERROR] Invalid json format: threshold_upper and threshold_lower must both exist\n";
+    return false;
+  }
+
+  const bool hasLeftUpper = ParseSingleNumber(text, "threshold_upper_left", cfg.thresholdUpperLeft);
+  const bool hasLeftLower = ParseSingleNumber(text, "threshold_lower_left", cfg.thresholdLowerLeft);
+  const bool hasRightUpper = ParseSingleNumber(text, "threshold_upper_right", cfg.thresholdUpperRight);
+  const bool hasRightLower = ParseSingleNumber(text, "threshold_lower_right", cfg.thresholdLowerRight);
+
+  if (hasLeftUpper != hasLeftLower || hasRightUpper != hasRightLower) {
+    std::cerr << "[ERROR] Invalid json format: left/right threshold_upper/lower pair is incomplete\n";
+    return false;
+  }
+
+  if (hasCommonUpper && hasCommonLower) {
+    if (!hasLeftUpper && !hasLeftLower) {
+      cfg.thresholdUpperLeft = commonUpper;
+      cfg.thresholdLowerLeft = commonLower;
+    }
+    if (!hasRightUpper && !hasRightLower) {
+      cfg.thresholdUpperRight = commonUpper;
+      cfg.thresholdLowerRight = commonLower;
+    }
+  }
+
+  if (!hasLeftUpper && !hasLeftLower && !hasCommonUpper) {
+    std::cerr << "[ERROR] Invalid json format: missing thresholds. "
+                 "Use threshold_upper/lower or left/right threshold pairs.\n";
+    return false;
+  }
+  if (!hasRightUpper && !hasRightLower && !hasCommonUpper) {
+    std::cerr << "[ERROR] Invalid json format: missing right-side thresholds. "
+                 "Use threshold_upper/lower or threshold_upper_right/lower_right.\n";
     return false;
   }
 
@@ -162,6 +200,16 @@ static bool LoadOffsetConfig(const std::string& jsonFile, OffsetConfig& cfg) {
     }
   }
   return true;
+}
+
+static inline bool IsWithinThreshold(double calibrated, int ch, const OffsetConfig& cfg) {
+  if (IsLeft(ch)) {
+    return (calibrated >= cfg.thresholdLowerLeft && calibrated <= cfg.thresholdUpperLeft);
+  }
+  if (IsRight(ch)) {
+    return (calibrated >= cfg.thresholdLowerRight && calibrated <= cfg.thresholdUpperRight);
+  }
+  return false;
 }
 
 static void FinalizeEvent(int evtnum, EventBuffers& ev) {
@@ -358,7 +406,7 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir,
         ? cfg.offsets[rec.ch]
         : 0.0;
       const double calibrated = static_cast<double>(rec.tdc) - offset;
-      if (calibrated >= cfg.thresholdLower && calibrated <= cfg.thresholdUpper) {
+      if (IsWithinThreshold(calibrated, rec.ch, cfg)) {
         ev.ch.push_back(rec.ch);
         ev.tdc.push_back(rec.tdc);
         ev.offset.push_back(offset);
