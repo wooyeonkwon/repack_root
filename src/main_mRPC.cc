@@ -143,9 +143,11 @@ static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
       hTdcRaw.Fit(&gausFit, "Q0");
 
       const double fitSigma = std::abs(gausFit.GetParameter(2));
+      mean = gausFit.GetParameter(1);
       if (fitSigma > 0.0) {
-        mean = gausFit.GetParameter(1);
         sigma = fitSigma;
+      } else {
+        sigma = std::abs(sigma);        
       }
     }
 
