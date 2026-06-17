@@ -9,7 +9,7 @@
 //   - clean = (hitnum==1 && edge==1)  [leading only]
 //   - mRPC reads only one side, so no pair/coincidence branches are produced
 //   - input channel 1..32 is reversed for output clean channel: ch = 33 - ch_raw
-//   - tdc_raw is binned in 20000-unit bins and fit with a Gaussian for each channel
+//   - tdc_raw is binned in 2000-unit bins and fit with a Gaussian for each channel
 //   - each channel keeps clean hits inside that channel's Gaussian mean +/- 3 sigma window
 //   - each raw hit stores its channel Gaussian mean in offset and calibrated raw time in tdc_cali_raw
 //   - clean hits additionally store their Gaussian mean in offset_clean and tdc = tdc_raw - offset
@@ -94,7 +94,8 @@ struct ChannelCalibration {
 
 static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
   const int kMaxCh = 64;
-  const double kBinWidth = 20000.0;
+  const double kBinWidth = 2000.0;
+  const double kInitialSigma = 1000.0;
 
   ChannelCalibration calibration;
   calibration.offsets.assign(kMaxCh + 1, 0.0);
@@ -143,7 +144,7 @@ static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
       const double modeTdc = hTdcRaw.GetBinCenter(modeBin);
 
       TF1 gausFit(fitName.c_str(), "gaus", histMin, histMax);
-      gausFit.SetParameters(modeEntryCount, modeTdc, kBinWidth);
+      gausFit.SetParameters(modeEntryCount, modeTdc, kInitialSigma);
       hTdcRaw.Fit(&gausFit, "Q0");
 
       const double fitSigma = std::abs(gausFit.GetParameter(2));
