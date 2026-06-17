@@ -9,15 +9,20 @@
 //   - clean = (hitnum==1 && edge==1)  [leading only]
 //   - mRPC reads only one side, so no pair/coincidence branches are produced
 //   - input channel 1..32 is reversed for output clean channel: ch = 33 - ch_raw
+//   - channel offsets and an upper clean threshold are estimated from single-hit TDC values
+//   - clean hits beyond the threshold are removed; events with nHit==0 are not written
 //   - streaming grouping by evtnum (assumes evtnum monotonic in file)
 
 #include <TFile.h>
 #include <TTree.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct TDC1Rec {
@@ -37,9 +42,8 @@ struct EventBuffers {
   std::vector<double> offset;
   std::vector<int> clean_rawIndex;
 
-  // QA
-  bool hasMultiHit = false;
-  int nMultiHit = 0;
+  // number of hits after clean selection and threshold removal
+  int nHit = 0;
 
   void reset() {
     ch_raw.clear();
@@ -50,8 +54,7 @@ struct EventBuffers {
     tdc.clear();
     offset.clear();
     clean_rawIndex.clear();
-    hasMultiHit = false;
-    nMultiHit = 0;
+    nHit = 0;
   }
 };
 
@@ -72,6 +75,203 @@ static inline int MapMrpcChannel(int chRaw) {
     return 33 - chRaw;
   }
   return chRaw;
+}
+
+struct ChannelCalibration {
+  std::vector<double> offsets;
+  double cleanThreshold = std::numeric_limits<double>::max();
+};
+
+static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
+  const int kMaxCh = 32;
+  const int kModeBinWidth = 1000;
+  const int kTargetHitCount = 1;
+
+  struct CleanHit {
+    int ch;
+    int tdc;
+  };
+
+  std::vector<std::vector<int>> eventTdcs;
+  std::vector<int> allTdcs;
+  eventTdcs.reserve(1024);
+  allTdcs.reserve(4096);
+
+  std::vector<CleanHit> eventHits;
+  eventHits.reserve(kMaxCh);
+  int curEvt = -1;
+
+  auto flushThresholdEvent = [&]() {
+    std::vector<int> tdcs;
+    tdcs.reserve(eventHits.size());
+    for (const CleanHit& h : eventHits) {
+      tdcs.push_back(h.tdc);
+      allTdcs.push_back(h.tdc);
+    }
+    eventTdcs.push_back(std::move(tdcs));
+  };
+
+  const Long64_t n = tin->GetEntries();
+  for (Long64_t i = 0; i < n; ++i) {
+    tin->GetEntry(i);
+    if (curEvt == -1) {
+      curEvt = rec.evtnum;
+    }
+    if (rec.evtnum != curEvt) {
+      flushThresholdEvent();
+      eventHits.clear();
+      curEvt = rec.evtnum;
+    }
+    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
+      eventHits.push_back({MapMrpcChannel(rec.ch), rec.tdc});
+    }
+  }
+  if (curEvt != -1) {
+    flushThresholdEvent();
+  }
+
+  int selectedThreshold = std::numeric_limits<int>::max();
+  if (!allTdcs.empty()) {
+    std::sort(allTdcs.begin(), allTdcs.end());
+    allTdcs.erase(std::unique(allTdcs.begin(), allTdcs.end()), allTdcs.end());
+    std::sort(allTdcs.rbegin(), allTdcs.rend());
+
+    long long bestEventCount = -1;
+    int bestThreshold = allTdcs.front();
+    for (const int threshold : allTdcs) {
+      long long eventCountWithTarget = 0;
+      for (const auto& tdcs : eventTdcs) {
+        int matched = 0;
+        for (const int v : tdcs) {
+          if (v < threshold) {
+            matched++;
+          }
+        }
+        if (matched == kTargetHitCount) {
+          eventCountWithTarget++;
+        }
+      }
+      if (eventCountWithTarget > bestEventCount
+          || (eventCountWithTarget == bestEventCount && threshold > bestThreshold)) {
+        bestEventCount = eventCountWithTarget;
+        bestThreshold = threshold;
+      }
+    }
+    selectedThreshold = bestThreshold;
+  }
+
+  std::vector<int> minVal(kMaxCh + 1, std::numeric_limits<int>::max());
+  std::vector<std::unordered_map<int, int>> binCounts(kMaxCh + 1);
+
+  auto isTargetEvent = [&](const std::vector<CleanHit>& hits) {
+    int matched = 0;
+    for (const CleanHit& h : hits) {
+      if (h.tdc < selectedThreshold) {
+        matched++;
+      }
+    }
+    return matched == kTargetHitCount;
+  };
+
+  auto accumulateEventForMode = [&](const std::vector<CleanHit>& hits) {
+    if (!isTargetEvent(hits)) {
+      return;
+    }
+    for (const CleanHit& h : hits) {
+      if (h.tdc >= selectedThreshold) {
+        continue;
+      }
+      minVal[h.ch] = std::min(minVal[h.ch], h.tdc);
+      const int binIdx = h.tdc / kModeBinWidth;
+      binCounts[h.ch][binIdx]++;
+    }
+  };
+
+  eventHits.clear();
+  curEvt = -1;
+  for (Long64_t i = 0; i < n; ++i) {
+    tin->GetEntry(i);
+    if (curEvt == -1) {
+      curEvt = rec.evtnum;
+    }
+    if (rec.evtnum != curEvt) {
+      accumulateEventForMode(eventHits);
+      eventHits.clear();
+      curEvt = rec.evtnum;
+    }
+    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
+      eventHits.push_back({MapMrpcChannel(rec.ch), rec.tdc});
+    }
+  }
+  if (curEvt != -1) {
+    accumulateEventForMode(eventHits);
+  }
+
+  std::vector<double> modeVal(kMaxCh + 1, 0.0);
+  for (int ch = 1; ch <= kMaxCh; ++ch) {
+    int bestCount = 0;
+    int bestBinIdx = 0;
+    for (const auto& kv : binCounts[ch]) {
+      if (kv.second > bestCount || (kv.second == bestCount && kv.first < bestBinIdx)) {
+        bestCount = kv.second;
+        bestBinIdx = kv.first;
+      }
+    }
+    if (bestCount > 0) {
+      modeVal[ch] = static_cast<double>(bestBinIdx * kModeBinWidth + (kModeBinWidth / 2));
+    }
+  }
+
+  std::vector<long long> sumVal(kMaxCh + 1, 0);
+  std::vector<long long> countVal(kMaxCh + 1, 0);
+  auto accumulateEventForAverage = [&](const std::vector<CleanHit>& hits) {
+    if (!isTargetEvent(hits)) {
+      return;
+    }
+    for (const CleanHit& h : hits) {
+      if (h.tdc >= selectedThreshold || binCounts[h.ch].empty()) {
+        continue;
+      }
+      const int minTdc = minVal[h.ch];
+      const double modeTdc = modeVal[h.ch];
+      const double maxTdc = 2.0 * modeTdc - static_cast<double>(minTdc);
+      if (static_cast<double>(h.tdc) >= static_cast<double>(minTdc)
+          && static_cast<double>(h.tdc) <= maxTdc) {
+        sumVal[h.ch] += h.tdc;
+        countVal[h.ch] += 1;
+      }
+    }
+  };
+
+  eventHits.clear();
+  curEvt = -1;
+  for (Long64_t i = 0; i < n; ++i) {
+    tin->GetEntry(i);
+    if (curEvt == -1) {
+      curEvt = rec.evtnum;
+    }
+    if (rec.evtnum != curEvt) {
+      accumulateEventForAverage(eventHits);
+      eventHits.clear();
+      curEvt = rec.evtnum;
+    }
+    if (rec.hitnum == 1 && rec.edge == 1 && rec.ch >= 1 && rec.ch <= kMaxCh) {
+      eventHits.push_back({MapMrpcChannel(rec.ch), rec.tdc});
+    }
+  }
+  if (curEvt != -1) {
+    accumulateEventForAverage(eventHits);
+  }
+
+  ChannelCalibration calibration;
+  calibration.offsets.assign(kMaxCh + 1, 0.0);
+  calibration.cleanThreshold = static_cast<double>(selectedThreshold);
+  for (int ch = 1; ch <= kMaxCh; ++ch) {
+    if (countVal[ch] > 0) {
+      calibration.offsets[ch] = static_cast<double>(sumVal[ch]) / static_cast<double>(countVal[ch]);
+    }
+  }
+  return calibration;
 }
 
 static int ProcessFile(const std::string& inFile, const std::string& outDir) {
@@ -133,8 +333,10 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   tout.Branch("offset", &ev.offset);
   tout.Branch("clean_rawIndex", &ev.clean_rawIndex);
 
-  tout.Branch("hasMultiHit", &ev.hasMultiHit);
-  tout.Branch("nMultiHit", &ev.nMultiHit);
+  tout.Branch("nHit", &ev.nHit);
+
+  const ChannelCalibration calibration = ComputeChannelCalibration(tin, rec);
+  std::cout << "[INFO] mRPC clean threshold: " << calibration.cleanThreshold << "\n";
 
   ev.reset();
   int curEvt = -1;
@@ -146,8 +348,11 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     if (curEvt == -1) curEvt = rec.evtnum;
 
     if (rec.evtnum != curEvt) {
-      o_evtnum = curEvt;
-      tout.Fill();
+      ev.nHit = static_cast<int>(ev.ch.size());
+      if (ev.nHit > 0) {
+        o_evtnum = curEvt;
+        tout.Fill();
+      }
       ev.reset();
       curEvt = rec.evtnum;
     }
@@ -158,22 +363,26 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     ev.edge_raw.push_back(rec.edge);
     ev.hitnum_raw.push_back(rec.hitnum);
 
-    if (rec.hitnum > 1) {
-      ev.hasMultiHit = true;
-      ev.nMultiHit++;
-    }
-
     if (rec.hitnum == 1 && rec.edge == 1) {
-      ev.ch.push_back(MapMrpcChannel(rec.ch));
-      ev.tdc.push_back(rec.tdc);
-      ev.offset.push_back(0.0);
-      ev.clean_rawIndex.push_back(rawIndex);
+      const int mappedCh = MapMrpcChannel(rec.ch);
+      const double offset = (mappedCh >= 1 && mappedCh < static_cast<int>(calibration.offsets.size()))
+        ? calibration.offsets[mappedCh]
+        : 0.0;
+      if (static_cast<double>(rec.tdc) < calibration.cleanThreshold) {
+        ev.ch.push_back(mappedCh);
+        ev.tdc.push_back(rec.tdc);
+        ev.offset.push_back(offset);
+        ev.clean_rawIndex.push_back(rawIndex);
+      }
     }
   }
 
   if (curEvt != -1) {
-    o_evtnum = curEvt;
-    tout.Fill();
+    ev.nHit = static_cast<int>(ev.ch.size());
+    if (ev.nHit > 0) {
+      o_evtnum = curEvt;
+      tout.Fill();
+    }
   }
 
   fout.Write();
