@@ -9,8 +9,9 @@
 //   - clean = (hitnum==1 && edge==1)  [leading only]
 //   - mRPC reads only one side, so no pair/coincidence branches are produced
 //   - input channel 1..32 is reversed for output clean channel: ch = 33 - ch_raw
-//   - tdc_raw is binned in 1000-unit bins and fit with a Gaussian
-//   - clean hit lists keep only hits inside the Gaussian mean +/- 3 sigma window
+//   - tdc_raw is binned in 1000-unit bins and fit with a Gaussian for each channel
+//   - each channel keeps clean hits inside that channel's Gaussian mean +/- 3 sigma window
+//   - each channel's Gaussian mean is stored as offset and tdc = tdc_raw - offset
 //   - evtnum and *_raw branches are always written, even when nHit==0
 //   - streaming grouping by evtnum (assumes evtnum monotonic in file)
 
@@ -41,8 +42,8 @@ struct EventBuffers {
   std::vector<int> ch_raw, tdc_raw, edge_raw, hitnum_raw;
 
   // clean (hitnum==1 && edge==1), with mRPC channel mapping applied
-  std::vector<int> ch, tdc;
-  std::vector<double> offset;
+  std::vector<int> ch;
+  std::vector<double> tdc, offset;
   std::vector<int> clean_rawIndex;
 
   // number of hits after clean selection and threshold removal
@@ -82,10 +83,9 @@ static inline int MapMrpcChannel(int chRaw) {
 
 struct ChannelCalibration {
   std::vector<double> offsets;
-  double gaussianMean = 0.0;
-  double gaussianSigma = 0.0;
-  double cleanLower = std::numeric_limits<double>::lowest();
-  double cleanUpper = std::numeric_limits<double>::max();
+  std::vector<double> gaussianSigma;
+  std::vector<double> cleanLower;
+  std::vector<double> cleanUpper;
 };
 
 static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
@@ -94,79 +94,69 @@ static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
 
   ChannelCalibration calibration;
   calibration.offsets.assign(kMaxCh + 1, 0.0);
+  calibration.gaussianSigma.assign(kMaxCh + 1, 0.0);
+  calibration.cleanLower.assign(kMaxCh + 1, std::numeric_limits<double>::lowest());
+  calibration.cleanUpper.assign(kMaxCh + 1, std::numeric_limits<double>::max());
 
   const Long64_t n = tin->GetEntries();
   if (n <= 0) {
     return calibration;
   }
 
-  int minTdc = std::numeric_limits<int>::max();
-  int maxTdc = std::numeric_limits<int>::lowest();
+  std::vector<std::vector<int>> tdcRawByCh(kMaxCh + 1);
   for (Long64_t i = 0; i < n; ++i) {
     tin->GetEntry(i);
-    minTdc = std::min(minTdc, rec.tdc);
-    maxTdc = std::max(maxTdc, rec.tdc);
-  }
-
-  if (minTdc == std::numeric_limits<int>::max()) {
-    return calibration;
-  }
-
-  const double histMin = std::floor(static_cast<double>(minTdc) / kBinWidth) * kBinWidth;
-  const double histMax = (std::floor(static_cast<double>(maxTdc) / kBinWidth) + 1.0) * kBinWidth;
-  const int nBins = std::max(1, static_cast<int>((histMax - histMin) / kBinWidth));
-
-  TH1D hTdcRaw("h_mrpc_tdc_raw", "mRPC tdc_raw;tdc_raw;counts", nBins, histMin, histMax);
-  for (Long64_t i = 0; i < n; ++i) {
-    tin->GetEntry(i);
-    hTdcRaw.Fill(rec.tdc);
-  }
-
-  calibration.gaussianMean = hTdcRaw.GetMean();
-  calibration.gaussianSigma = hTdcRaw.GetRMS();
-
-  if (hTdcRaw.GetEntries() > 0) {
-    const int modeBin = hTdcRaw.GetMaximumBin();
-    const double modeEntryCount = hTdcRaw.GetBinContent(modeBin);
-    const double modeTdc = hTdcRaw.GetBinCenter(modeBin);
-
-    TF1 gausFit("mrpc_tdc_raw_gaus", "gaus", histMin, histMax);
-    gausFit.SetParameters(modeEntryCount, modeTdc, kBinWidth);
-    hTdcRaw.Fit(&gausFit, "Q0");
-
-    const double fitSigma = std::abs(gausFit.GetParameter(2));
-    if (fitSigma > 0.0) {
-      calibration.gaussianMean = gausFit.GetParameter(1);
-      calibration.gaussianSigma = fitSigma;
-    }
-  }
-
-  if (calibration.gaussianSigma > 0.0) {
-    calibration.cleanLower = calibration.gaussianMean - 3.0 * calibration.gaussianSigma;
-    calibration.cleanUpper = calibration.gaussianMean + 3.0 * calibration.gaussianSigma;
-  }
-
-  std::vector<long long> sumVal(kMaxCh + 1, 0);
-  std::vector<long long> countVal(kMaxCh + 1, 0);
-  for (Long64_t i = 0; i < n; ++i) {
-    tin->GetEntry(i);
-    if (rec.hitnum != 1 || rec.edge != 1 || rec.ch < 1 || rec.ch > kMaxCh) {
+    if (rec.ch < 1 || rec.ch > kMaxCh) {
       continue;
     }
-    if (static_cast<double>(rec.tdc) < calibration.cleanLower
-        || static_cast<double>(rec.tdc) > calibration.cleanUpper) {
-      continue;
-    }
-    const int mappedCh = MapMrpcChannel(rec.ch);
-    sumVal[mappedCh] += rec.tdc;
-    countVal[mappedCh] += 1;
+    tdcRawByCh[MapMrpcChannel(rec.ch)].push_back(rec.tdc);
   }
 
   for (int ch = 1; ch <= kMaxCh; ++ch) {
-    if (countVal[ch] > 0) {
-      calibration.offsets[ch] = static_cast<double>(sumVal[ch]) / static_cast<double>(countVal[ch]);
+    const std::vector<int>& tdcs = tdcRawByCh[ch];
+    if (tdcs.empty()) {
+      continue;
+    }
+
+    const auto [minIt, maxIt] = std::minmax_element(tdcs.begin(), tdcs.end());
+    const double histMin = std::floor(static_cast<double>(*minIt) / kBinWidth) * kBinWidth;
+    const double histMax = (std::floor(static_cast<double>(*maxIt) / kBinWidth) + 1.0) * kBinWidth;
+    const int nBins = std::max(1, static_cast<int>((histMax - histMin) / kBinWidth));
+
+    const std::string histName = "h_mrpc_tdc_raw_ch" + std::to_string(ch);
+    const std::string fitName = "mrpc_tdc_raw_gaus_ch" + std::to_string(ch);
+    TH1D hTdcRaw(histName.c_str(), "mRPC tdc_raw;tdc_raw;counts", nBins, histMin, histMax);
+    for (const int tdcRaw : tdcs) {
+      hTdcRaw.Fill(tdcRaw);
+    }
+
+    double mean = hTdcRaw.GetMean();
+    double sigma = hTdcRaw.GetRMS();
+
+    if (hTdcRaw.GetEntries() > 0) {
+      const int modeBin = hTdcRaw.GetMaximumBin();
+      const double modeEntryCount = hTdcRaw.GetBinContent(modeBin);
+      const double modeTdc = hTdcRaw.GetBinCenter(modeBin);
+
+      TF1 gausFit(fitName.c_str(), "gaus", histMin, histMax);
+      gausFit.SetParameters(modeEntryCount, modeTdc, kBinWidth);
+      hTdcRaw.Fit(&gausFit, "Q0");
+
+      const double fitSigma = std::abs(gausFit.GetParameter(2));
+      if (fitSigma > 0.0) {
+        mean = gausFit.GetParameter(1);
+        sigma = fitSigma;
+      }
+    }
+
+    calibration.offsets[ch] = mean;
+    calibration.gaussianSigma[ch] = sigma;
+    if (sigma > 0.0) {
+      calibration.cleanLower[ch] = mean - 3.0 * sigma;
+      calibration.cleanUpper[ch] = mean + 3.0 * sigma;
     }
   }
+
   return calibration;
 }
 
@@ -232,10 +222,7 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   tout.Branch("nHit", &ev.nHit);
 
   const ChannelCalibration calibration = ComputeChannelCalibration(tin, rec);
-  std::cout << "[INFO] mRPC TDC Gaussian mean=" << calibration.gaussianMean
-            << " sigma=" << calibration.gaussianSigma
-            << " cleanWindow=[" << calibration.cleanLower << ", "
-            << calibration.cleanUpper << "]\n";
+  std::cout << "[INFO] mRPC per-channel Gaussian calibration computed\n";
 
   ev.reset();
   int curEvt = -1;
@@ -262,13 +249,16 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
 
     if (rec.hitnum == 1 && rec.edge == 1) {
       const int mappedCh = MapMrpcChannel(rec.ch);
-      const double offset = (mappedCh >= 1 && mappedCh < static_cast<int>(calibration.offsets.size()))
-        ? calibration.offsets[mappedCh]
-        : 0.0;
-      if (static_cast<double>(rec.tdc) >= calibration.cleanLower
-          && static_cast<double>(rec.tdc) <= calibration.cleanUpper) {
+      const bool knownCh = mappedCh >= 1 && mappedCh < static_cast<int>(calibration.offsets.size());
+      const double offset = knownCh ? calibration.offsets[mappedCh] : 0.0;
+      const double cleanLower = knownCh ? calibration.cleanLower[mappedCh]
+                                       : std::numeric_limits<double>::lowest();
+      const double cleanUpper = knownCh ? calibration.cleanUpper[mappedCh]
+                                       : std::numeric_limits<double>::max();
+      if (static_cast<double>(rec.tdc) >= cleanLower
+          && static_cast<double>(rec.tdc) <= cleanUpper) {
         ev.ch.push_back(mappedCh);
-        ev.tdc.push_back(rec.tdc);
+        ev.tdc.push_back(static_cast<double>(rec.tdc) - offset);
         ev.offset.push_back(offset);
         ev.clean_rawIndex.push_back(rawIndex);
       }
