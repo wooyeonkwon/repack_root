@@ -125,9 +125,13 @@ static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
   calibration.gaussianMean = hTdcRaw.GetMean();
   calibration.gaussianSigma = hTdcRaw.GetRMS();
 
-  if (hTdcRaw.GetEntries() > 0 && calibration.gaussianSigma > 0.0) {
+  if (hTdcRaw.GetEntries() > 0) {
+    const int modeBin = hTdcRaw.GetMaximumBin();
+    const double modeEntryCount = hTdcRaw.GetBinContent(modeBin);
+    const double modeTdc = hTdcRaw.GetBinCenter(modeBin);
+
     TF1 gausFit("mrpc_tdc_raw_gaus", "gaus", histMin, histMax);
-    gausFit.SetParameters(hTdcRaw.GetMaximum(), calibration.gaussianMean, calibration.gaussianSigma);
+    gausFit.SetParameters(modeEntryCount, modeTdc, kBinWidth);
     hTdcRaw.Fit(&gausFit, "Q0");
 
     const double fitSigma = std::abs(gausFit.GetParameter(2));
