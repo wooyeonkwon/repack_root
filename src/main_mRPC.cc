@@ -9,9 +9,10 @@
 //   - clean = (hitnum==1 && edge==1)  [leading only]
 //   - mRPC reads only one side, so no pair/coincidence branches are produced
 //   - input channel 1..32 is reversed for output clean channel: ch = 33 - ch_raw
-//   - tdc_raw is binned in 1000-unit bins and fit with a Gaussian for each channel
+//   - tdc_raw is binned in 20000-unit bins and fit with a Gaussian for each channel
 //   - each channel keeps clean hits inside that channel's Gaussian mean +/- 3 sigma window
-//   - each channel's Gaussian mean is stored as offset and tdc = tdc_raw - offset
+//   - each raw hit stores its channel Gaussian mean in offset and calibrated raw time in tdc_cali_raw
+//   - clean hits additionally store their Gaussian mean in offset_clean and tdc = tdc_raw - offset
 //   - evtnum and *_raw branches are always written, even when nHit==0
 //   - streaming grouping by evtnum (assumes evtnum monotonic in file)
 
@@ -38,12 +39,13 @@ struct TDC1Rec {
 };
 
 struct EventBuffers {
-  // raw input values
+  // raw input values, with per-raw-hit calibration values aligned by index
   std::vector<int> ch_raw, tdc_raw, edge_raw, hitnum_raw;
+  std::vector<double> offset, tdc_cali_raw;
 
   // clean (hitnum==1 && edge==1), with mRPC channel mapping applied
   std::vector<int> ch;
-  std::vector<double> tdc, offset;
+  std::vector<double> tdc, offset_clean;
   std::vector<int> clean_rawIndex;
 
   // number of hits after clean selection and threshold removal
@@ -54,9 +56,11 @@ struct EventBuffers {
     tdc_raw.clear();
     edge_raw.clear();
     hitnum_raw.clear();
+    offset.clear();
+    tdc_cali_raw.clear();
     ch.clear();
     tdc.clear();
-    offset.clear();
+    offset_clean.clear();
     clean_rawIndex.clear();
     nHit = 0;
   }
@@ -215,10 +219,12 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   tout.Branch("tdc_raw", &ev.tdc_raw);
   tout.Branch("edge_raw", &ev.edge_raw);
   tout.Branch("hitnum_raw", &ev.hitnum_raw);
+  tout.Branch("offset", &ev.offset);
+  tout.Branch("tdc_cali_raw", &ev.tdc_cali_raw);
 
   tout.Branch("ch", &ev.ch);
   tout.Branch("tdc", &ev.tdc);
-  tout.Branch("offset", &ev.offset);
+  tout.Branch("offset_clean", &ev.offset_clean);
   tout.Branch("clean_rawIndex", &ev.clean_rawIndex);
 
   tout.Branch("nHit", &ev.nHit);
@@ -249,10 +255,13 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     ev.edge_raw.push_back(rec.edge);
     ev.hitnum_raw.push_back(rec.hitnum);
 
+    const int mappedCh = MapMrpcChannel(rec.ch);
+    const bool knownCh = mappedCh >= 1 && mappedCh < static_cast<int>(calibration.offsets.size());
+    const double offset = knownCh ? calibration.offsets[mappedCh] : 0.0;
+    ev.offset.push_back(offset);
+    ev.tdc_cali_raw.push_back(static_cast<double>(rec.tdc) - offset);
+
     if (rec.hitnum == 1 && rec.edge == 1) {
-      const int mappedCh = MapMrpcChannel(rec.ch);
-      const bool knownCh = mappedCh >= 1 && mappedCh < static_cast<int>(calibration.offsets.size());
-      const double offset = knownCh ? calibration.offsets[mappedCh] : 0.0;
       const double cleanLower = knownCh ? calibration.cleanLower[mappedCh]
                                        : std::numeric_limits<double>::lowest();
       const double cleanUpper = knownCh ? calibration.cleanUpper[mappedCh]
@@ -261,7 +270,7 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
           && static_cast<double>(rec.tdc) <= cleanUpper) {
         ev.ch.push_back(mappedCh);
         ev.tdc.push_back(static_cast<double>(rec.tdc) - offset);
-        ev.offset.push_back(offset);
+        ev.offset_clean.push_back(offset);
         ev.clean_rawIndex.push_back(rawIndex);
       }
     }
