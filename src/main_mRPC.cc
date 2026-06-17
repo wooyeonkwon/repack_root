@@ -89,8 +89,8 @@ struct ChannelCalibration {
 };
 
 static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
-  const int kMaxCh = 32;
-  const double kBinWidth = 1000.0;
+  const int kMaxCh = 64;
+  const double kBinWidth = 20000.0;
 
   ChannelCalibration calibration;
   calibration.offsets.assign(kMaxCh + 1, 0.0);

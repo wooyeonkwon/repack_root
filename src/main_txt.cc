@@ -42,17 +42,17 @@ static void FillDefaultHead(Head1Rec& head) {
   head.emode = 1;
   head.rmode = 1;
   head.range = 2;
-  head.delay = 100;
+  head.delay = 1;
   head.NtrigMax = 0;
   const int mask_values[64] = {
-    1, 1, 1, 1, 1, 1, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 1, 1, 1, 1, 1, 1
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   };
   for (int i = 0; i < 64; ++i) {
     head.mask[i] = mask_values[i];
