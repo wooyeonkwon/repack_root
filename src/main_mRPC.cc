@@ -96,6 +96,7 @@ static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
   const int kMaxCh = 64;
   const double kBinWidth = 2000.0;
   const double kInitialSigma = 1000.0;
+  const double kFitHalfWidth = 3.0 * kInitialSigma;
 
   ChannelCalibration calibration;
   calibration.offsets.assign(kMaxCh + 1, 0.0);
@@ -112,6 +113,9 @@ static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
   for (Long64_t i = 0; i < n; ++i) {
     tin->GetEntry(i);
     if (rec.ch < 1 || rec.ch > kMaxCh) {
+      continue;
+    }
+    if (rec.hitnum != 1 || rec.edge != 1) {
       continue;
     }
     tdcRawByCh[MapMrpcChannel(rec.ch)].push_back(rec.tdc);
@@ -143,16 +147,26 @@ static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
       const double modeEntryCount = hTdcRaw.GetBinContent(modeBin);
       const double modeTdc = hTdcRaw.GetBinCenter(modeBin);
 
-      TF1 gausFit(fitName.c_str(), "gaus", histMin, histMax);
+      const double fitMin = std::max(histMin, modeTdc - kFitHalfWidth);
+      const double fitMax = std::min(histMax, modeTdc + kFitHalfWidth);
+
+      TF1 gausFit(fitName.c_str(), "gaus", fitMin, fitMax);
       gausFit.SetParameters(modeEntryCount, modeTdc, kInitialSigma);
-      hTdcRaw.Fit(&gausFit, "Q0");
+      gausFit.SetParLimits(1, fitMin, fitMax);
+      gausFit.SetParLimits(2, 1.0, kFitHalfWidth);
+      hTdcRaw.Fit(&gausFit, "Q0R");
 
       const double fitSigma = std::abs(gausFit.GetParameter(2));
-      mean = gausFit.GetParameter(1);
-      if (fitSigma > 0.0) {
+      const double fitMean = gausFit.GetParameter(1);
+      if (std::isfinite(fitMean) && fitMean >= fitMin && fitMean <= fitMax) {
+        mean = fitMean;
+      } else {
+        mean = modeTdc;
+      }
+      if (std::isfinite(fitSigma) && fitSigma > 0.0) {
         sigma = fitSigma;
       } else {
-        sigma = std::abs(sigma);        
+        sigma = kInitialSigma;
       }
     }
 
