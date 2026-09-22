@@ -9,15 +9,20 @@
 //   - clean = (hitnum==1 && edge==1)  [leading only]
 //   - mRPC reads only one side, so no pair/coincidence branches are produced
 //   - input channel 1..32 is reversed for output clean channel: ch = 33 - ch_raw
-//   - tdc_raw is binned in 2000-unit bins and fit with a Gaussian for each channel
-//   - each channel keeps clean hits inside that channel's Gaussian mean +/- 3 sigma window
-//   - each raw hit stores its channel Gaussian mean in offset and calibrated raw time in tdc_cali_raw
-//   - clean hits additionally store their Gaussian mean in offset_clean and tdc = tdc_raw - offset
+//   - first leading hits locate each channel peak with 2000-ps bins
+//   - a local +/-3000-ps histogram with 200-ps bins is used for the Gaussian fit
+//   - invalid fits warn and use a local median/MAD window, or the fixed peak-search window
+//   - fallback windows stay inside the local +/-3000-ps peak-search region
+//   - TimingCalibration records the method and actual selection bounds per channel
+//   - each raw hit stores its channel timing center in offset and calibrated raw time in tdc_cali_raw
+//   - clean hits additionally store their timing center in offset_clean and tdc = tdc_raw - offset
 //   - evtnum and *_raw branches are always written, even when nHit==0
 //   - streaming grouping by evtnum (assumes evtnum monotonic in file)
 
 #include <TFile.h>
 #include <TF1.h>
+#include <TFitResult.h>
+#include <TFitResultPtr.h>
 #include <TH1D.h>
 #include <TTree.h>
 
@@ -87,22 +92,33 @@ static inline int MapMrpcChannel(int chRaw) {
 
 struct ChannelCalibration {
   std::vector<double> offsets;
-  std::vector<double> gaussianSigma;
+  std::vector<double> windowScalePs;
   std::vector<double> cleanLower;
   std::vector<double> cleanUpper;
+  // 0: no first leading hits; 1: Gaussian; 2: local median/MAD; 3: fixed window.
+  std::vector<int> method;
 };
+
+static double Median(std::vector<double> values) {
+  if (values.empty()) return std::numeric_limits<double>::quiet_NaN();
+  std::sort(values.begin(), values.end());
+  const size_t mid = values.size() / 2;
+  return values.size() % 2 ? values[mid] : 0.5 * (values[mid - 1] + values[mid]);
+}
 
 static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
   const int kMaxCh = 64;
   const double kBinWidth = 2000.0;
+  const double kFitBinWidth = 200.0;
   const double kInitialSigma = 1000.0;
   const double kFitHalfWidth = 3.0 * kInitialSigma;
 
   ChannelCalibration calibration;
   calibration.offsets.assign(kMaxCh + 1, 0.0);
-  calibration.gaussianSigma.assign(kMaxCh + 1, 0.0);
-  calibration.cleanLower.assign(kMaxCh + 1, std::numeric_limits<double>::lowest());
-  calibration.cleanUpper.assign(kMaxCh + 1, std::numeric_limits<double>::max());
+  calibration.windowScalePs.assign(kMaxCh + 1, 0.0);
+  calibration.method.assign(kMaxCh + 1, 0);
+  calibration.cleanLower.assign(kMaxCh + 1, std::numeric_limits<double>::quiet_NaN());
+  calibration.cleanUpper.assign(kMaxCh + 1, std::numeric_limits<double>::quiet_NaN());
 
   const Long64_t n = tin->GetEntries();
   if (n <= 0) {
@@ -135,43 +151,84 @@ static ChannelCalibration ComputeChannelCalibration(TTree* tin, TDC1Rec& rec) {
     const std::string histName = "h_mrpc_tdc_raw_ch" + std::to_string(ch);
     const std::string fitName = "mrpc_tdc_raw_gaus_ch" + std::to_string(ch);
     TH1D hTdcRaw(histName.c_str(), "mRPC tdc_raw;tdc_raw;counts", nBins, histMin, histMax);
+    hTdcRaw.SetDirectory(nullptr);
     for (const int tdcRaw : tdcs) {
       hTdcRaw.Fill(tdcRaw);
     }
 
-    double mean = hTdcRaw.GetMean();
-    double sigma = hTdcRaw.GetRMS();
-
-    if (hTdcRaw.GetEntries() > 0) {
-      const int modeBin = hTdcRaw.GetMaximumBin();
-      const double modeEntryCount = hTdcRaw.GetBinContent(modeBin);
-      const double modeTdc = hTdcRaw.GetBinCenter(modeBin);
-
-      const double fitMin = std::max(histMin, modeTdc - kFitHalfWidth);
-      const double fitMax = std::min(histMax, modeTdc + kFitHalfWidth);
-
-      TF1 gausFit(fitName.c_str(), "gaus", fitMin, fitMax);
-      gausFit.SetParameters(modeEntryCount, modeTdc, kInitialSigma);
-      gausFit.SetParLimits(1, fitMin, fitMax);
-      gausFit.SetParLimits(2, 1.0, kFitHalfWidth);
-      hTdcRaw.Fit(&gausFit, "Q0R");
-
-      const double fitSigma = std::abs(gausFit.GetParameter(2));
-      const double fitMean = gausFit.GetParameter(1);
-      if (std::isfinite(fitMean) && fitMean >= fitMin && fitMean <= fitMax) {
-        mean = fitMean;
-      } else {
-        mean = modeTdc;
-      }
-      if (std::isfinite(fitSigma) && fitSigma > 0.0) {
-        sigma = fitSigma;
-      } else {
-        sigma = kInitialSigma;
+    const double modeTdc = hTdcRaw.GetBinCenter(hTdcRaw.GetMaximumBin());
+    const double fitMin = modeTdc - kFitHalfWidth;
+    const double fitMax = modeTdc + kFitHalfWidth;
+    const int nFitBins = static_cast<int>(std::lround((fitMax - fitMin) / kFitBinWidth));
+    const std::string fineName = histName + "_peak";
+    TH1D hPeak(fineName.c_str(), "Channel timing peak;TDC time (ps);Counts",
+               nFitBins, fitMin, fitMax);
+    hPeak.SetDirectory(nullptr);
+    int peakEntries = 0;
+    std::vector<double> peakTimes;
+    for (const int tdcRaw : tdcs) {
+      if (tdcRaw >= fitMin && tdcRaw < fitMax) {
+        hPeak.Fill(tdcRaw);
+        ++peakEntries;
+        peakTimes.push_back(tdcRaw);
       }
     }
 
+    TF1 gausFit(fitName.c_str(), "gaus", fitMin, fitMax);
+    gausFit.SetParameters(hPeak.GetMaximum(), modeTdc, kInitialSigma);
+    gausFit.SetParLimits(1, fitMin, fitMax);
+    gausFit.SetParLimits(2, 1.0, kFitHalfWidth);
+    // Poisson likelihood includes empty bins; I averages the model within each bin.
+    // S retains diagnostics, N avoids storing/drawing the temporary function.
+    TFitResultPtr result = hPeak.Fit(&gausFit, "QSNRLI");
+    const int status = result;
+    const double mean = gausFit.GetParameter(1);
+    const double sigma = gausFit.GetParameter(2);
+    const double boundaryTolerance = 0.1; // ps
+    const bool valid = result.Get() && status == 0 && result->IsValid()
+        && result->CovMatrixStatus() == 3 && result->Ndf() > 0
+        && std::isfinite(gausFit.GetParameter(0)) && gausFit.GetParameter(0) > 0.0
+        && std::isfinite(mean) && mean > fitMin + boundaryTolerance
+        && mean < fitMax - boundaryTolerance
+        && std::isfinite(sigma) && sigma > 1.0 + boundaryTolerance
+        && sigma < kFitHalfWidth - boundaryTolerance;
+    std::cout << "[CALIB] ch=" << ch << " firstLeadingHits=" << tdcs.size()
+              << " peakEntries=" << peakEntries << " bins=" << nFitBins
+              << " status=" << status
+              << " covStatus=" << (result.Get() ? result->CovMatrixStatus() : -1)
+              << " mean_ps=" << mean << " sigma_ps=" << sigma
+              << " accepted=" << valid << "\n";
+    if (!valid) {
+      // Estimate only the local peak, never the long raw-time tail. This is a
+      // selection fallback, not a Gaussian resolution measurement. Require at
+      // least 10 local hits for the robust estimate; otherwise keep the original
+      // fixed search window. Both choices remain explicitly flagged in output.
+      const double median = Median(peakTimes);
+      std::vector<double> deviations;
+      for (const double time : peakTimes) deviations.push_back(std::abs(time - median));
+      const double robustScale = 1.4826 * Median(deviations);
+      const bool useRobust = peakTimes.size() >= 10 && std::isfinite(median)
+          && std::isfinite(robustScale) && robustScale >= kFitBinWidth / 2.0
+          && robustScale < kFitHalfWidth;
+      const double center = useRobust ? median : modeTdc;
+      const double scale = useRobust ? robustScale : kInitialSigma;
+      calibration.method[ch] = useRobust ? 2 : 3;
+      calibration.offsets[ch] = center;
+      calibration.windowScalePs[ch] = scale;
+      calibration.cleanLower[ch] = std::max(fitMin, center - 3.0 * scale);
+      calibration.cleanUpper[ch] = std::min(fitMax, center + 3.0 * scale);
+      std::cerr << "[WARN] Invalid timing fit for channel " << ch
+                << "; using " << (useRobust ? "local median/MAD" : "fixed peak window")
+                << ": offset_ps=" << center << " window_scale_ps=" << scale
+                << " lower_ps=" << calibration.cleanLower[ch]
+                << " upper_ps=" << calibration.cleanUpper[ch]
+                << ". Fallback scale is NOT a measured Gaussian sigma.\n";
+      continue;
+    }
+
     calibration.offsets[ch] = mean;
-    calibration.gaussianSigma[ch] = sigma;
+    calibration.windowScalePs[ch] = sigma;
+    calibration.method[ch] = 1;
     if (sigma > 0.0) {
       calibration.cleanLower[ch] = mean - 3.0 * sigma;
       calibration.cleanUpper[ch] = mean + 3.0 * sigma;
@@ -209,6 +266,9 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
               << "). Streaming grouping may break.\n";
   }
 
+  const ChannelCalibration calibration = ComputeChannelCalibration(tin, rec);
+  std::cout << "[INFO] mRPC per-channel timing calibration computed\n";
+
   const std::string outFile = outPath.string();
   TFile fout(outFile.c_str(), "RECREATE");
   if (fout.IsZombie()) {
@@ -223,6 +283,26 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   }
 
   fout.cd();
+  // Persist fallback information so it survives beyond the console log.
+  TTree calibrationTree("TimingCalibration", "Methods: 0=empty, 1=Gaussian, 2=local median/MAD, 3=fixed window");
+  int calCh = 0, calMethod = 0;
+  double calOffset = 0.0, calScale = 0.0, calSigma = 0.0, calLower = 0.0, calUpper = 0.0;
+  calibrationTree.Branch("ch", &calCh);
+  calibrationTree.Branch("method", &calMethod);
+  calibrationTree.Branch("offset_ps", &calOffset);
+  calibrationTree.Branch("window_scale_ps", &calScale);
+  calibrationTree.Branch("gaussian_sigma_ps", &calSigma);
+  calibrationTree.Branch("lower_ps", &calLower);
+  calibrationTree.Branch("upper_ps", &calUpper);
+  for (calCh = 1; calCh <= 64; ++calCh) {
+    calMethod = calibration.method[calCh];
+    calOffset = calibration.offsets[calCh];
+    calScale = calibration.windowScalePs[calCh];
+    calSigma = calMethod == 1 ? calScale : std::numeric_limits<double>::quiet_NaN();
+    calLower = calibration.cleanLower[calCh];
+    calUpper = calibration.cleanUpper[calCh];
+    calibrationTree.Fill();
+  }
   TTree tout("Events", "Event-level repacked TDC1 for mRPC");
 
   int o_evtnum = 0;
@@ -244,11 +324,10 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
 
   tout.Branch("nHit", &ev.nHit);
 
-  const ChannelCalibration calibration = ComputeChannelCalibration(tin, rec);
-  std::cout << "[INFO] mRPC per-channel Gaussian calibration computed\n";
-
   ev.reset();
   int curEvt = -1;
+  Long64_t firstLeadingHits = 0;
+  Long64_t acceptedHits = 0;
 
   const Long64_t nEnt = tin->GetEntries();
   for (Long64_t i = 0; i < nEnt; ++i) {
@@ -276,13 +355,14 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
     ev.offset.push_back(offset);
     ev.tdc_cali_raw.push_back(static_cast<double>(rec.tdc) - offset);
 
-    if (rec.hitnum == 1 && rec.edge == 1) {
-      const double cleanLower = knownCh ? calibration.cleanLower[mappedCh]
-                                       : std::numeric_limits<double>::lowest();
-      const double cleanUpper = knownCh ? calibration.cleanUpper[mappedCh]
-                                       : std::numeric_limits<double>::max();
+    if (knownCh && calibration.method[mappedCh] != 0
+        && rec.hitnum == 1 && rec.edge == 1) {
+      ++firstLeadingHits;
+      const double cleanLower = calibration.cleanLower[mappedCh];
+      const double cleanUpper = calibration.cleanUpper[mappedCh];
       if (static_cast<double>(rec.tdc) >= cleanLower
           && static_cast<double>(rec.tdc) <= cleanUpper) {
+        ++acceptedHits;
         ev.ch.push_back(mappedCh);
         ev.tdc.push_back(static_cast<double>(rec.tdc) - offset);
         ev.offset_clean.push_back(offset);
@@ -301,6 +381,9 @@ static int ProcessFile(const std::string& inFile, const std::string& outDir) {
   fout.Close();
   fin.Close();
 
+  std::cout << "[SELECTION] rawRecords=" << nEnt
+            << " firstLeadingHits=" << firstLeadingHits
+            << " acceptedHits=" << acceptedHits << "\n";
   std::cout << "[INFO] Done. Output: " << outFile << "\n";
   return 0;
 }
